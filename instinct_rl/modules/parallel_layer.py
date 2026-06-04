@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from instinct_rl.modules.conv2d import Conv2dHeadModel
+from instinct_rl.modules.cross_attention import DepthProprioCrossAttentionModel
 from instinct_rl.modules.mlp import MlpModel
 from instinct_rl.modules.transformer import TransformerHeadModel
 from instinct_rl.utils.utils import (
@@ -61,6 +62,7 @@ class ParallelLayer(nn.Module):
         input_component_shapes = [input_segments[name] for name in model_kwargs.pop("component_names")]
         output_size = model_kwargs.pop("output_size")
         model_kwargs.pop("takeout_input_components")
+        model_kwargs.pop("takeout_component_names", None)
         # This code is not clean enough, need to sort out later
         if model_class_name == "MlpModel":
             hidden_sizes = model_kwargs.pop("hidden_sizes") + [
@@ -89,6 +91,12 @@ class ParallelLayer(nn.Module):
                 output_size=output_size,
                 **model_kwargs,
             )
+        elif model_class_name == "DepthProprioCrossAttentionModel":
+            model = DepthProprioCrossAttentionModel(
+                input_component_shapes,
+                output_size=output_size,
+                **model_kwargs,
+            )
         else:
             model = None  # leave for subclass to implement
         return model
@@ -101,7 +109,9 @@ class ParallelLayer(nn.Module):
             self.output_segment[self._output_component_name_prefix + block_name] = config.get(
                 "output_shape", (config["output_size"],)
             )
-            if config.get("takeout_input_components", False):
+            if "takeout_component_names" in config and config["takeout_component_names"] is not None:
+                components_to_takeout.update(config["takeout_component_names"])
+            elif config.get("takeout_input_components", False):
                 components_to_takeout.update(config["component_names"])
         if len(components_to_takeout) > 0:
             self.output_segment = OrderedDict(

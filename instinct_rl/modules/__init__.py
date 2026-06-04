@@ -9,6 +9,7 @@ from .all_mixer import (
     EncoderStateAcRecurrent,
     EncoderVaeActorCritic,
 )
+from .cross_attention import DepthProprioCrossAttentionModel
 from .discriminator import Discriminator
 from .encoder_actor_critic import EncoderActorCritic, EncoderActorCriticRecurrent
 from .moe_actor_critic import MoEActorCritic
@@ -17,6 +18,7 @@ from .normalizer import (
     EmpiricalNormalization,
 )
 from .parallel_layer import ParallelLayer
+from .residual_moe_actor_critic import EncoderResidualMoEActorCritic, ResidualMoEActorCritic
 from .state_estimator import (
     EstimatorActorCritic,
     EstimatorActorCriticRecurrent,

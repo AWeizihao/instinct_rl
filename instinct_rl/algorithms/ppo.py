@@ -54,6 +54,8 @@ class PPO:
         value_loss_coef=1.0,
         entropy_coef=0.0,
         learning_rate=1e-3,
+        learning_rate_min=1e-5,
+        learning_rate_max=1e-2,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
         clip_min_std=1e-15,  # clip the policy.std if it supports, check update()
@@ -77,6 +79,8 @@ class PPO:
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        self.learning_rate_min = learning_rate_min
+        self.learning_rate_max = learning_rate_max
         self.auxiliary_reward_per_env_reward_coefs = (
             torch.tensor(auxiliary_reward_per_env_reward_coefs, device=self.device).unsqueeze(0)  # (1, num_rewards)
             if len(auxiliary_reward_per_env_reward_coefs) > 0
@@ -249,9 +253,9 @@ class PPO:
                     kl_mean /= dist.get_world_size()
 
                 if kl_mean > self.desired_kl * 2.0:
-                    self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    self.learning_rate = max(self.learning_rate_min, self.learning_rate / 1.5)
                 elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                    self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                    self.learning_rate = min(self.learning_rate_max, self.learning_rate * 1.5)
 
                 if dist.is_initialized():
                     # broadcast the learning rate to all processes

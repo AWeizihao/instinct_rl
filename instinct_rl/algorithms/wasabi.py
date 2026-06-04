@@ -40,6 +40,7 @@ class WasabiAlgoMixin:
         discriminator_logit_weight_decay_coef=0.0,  # loss for last layer weight
         discriminator_gradient_torlerance=0.0,  # If the computed gradient is smaller than this value, the gradient will not be penalized.
         discriminator_backbone_gradient_only=False,  # If True, the discriminator must support encoders and backbone_run function.
+        discriminator_update_interval=1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -58,6 +59,7 @@ class WasabiAlgoMixin:
         self.discriminator_logit_weight_decay_coef = discriminator_logit_weight_decay_coef
         self.discriminator_gradient_torlerance = discriminator_gradient_torlerance
         self.discriminator_backbone_gradient_only = discriminator_backbone_gradient_only
+        self.discriminator_update_interval = max(int(discriminator_update_interval), 1)
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1):
         super().init_storage(num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards)
@@ -127,6 +129,17 @@ class WasabiAlgoMixin:
 
     def update(self, *args, **kwargs):
         mean_losses, average_stats = super().update(*args, **kwargs)
+
+        update_discriminator = (
+            self.discriminator_update_interval <= 1
+            or self.current_learning_iteration % self.discriminator_update_interval == 0
+        )
+        average_stats["discriminator_update_active"] = torch.tensor(
+            float(update_discriminator), device=self.device
+        )
+        if not update_discriminator:
+            self.amp_storage.clear()
+            return mean_losses, average_stats
 
         # iterate over the discriminator optimization steps
         if self.discriminator.is_recurrent:

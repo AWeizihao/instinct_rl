@@ -73,6 +73,8 @@ class RolloutStorage:
             "old_sigma",
             "hidden_states",
             "masks",
+            "time_indices",
+            "env_indices",
         ],
     )
 
@@ -284,6 +286,8 @@ class RolloutStorage:
             old_sigma_batch,
             hid_batch,
             obs_mask_batch,
+            T_select,
+            B_select,
         )
 
 

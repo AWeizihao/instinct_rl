@@ -47,6 +47,7 @@ class MoeLayer(nn.Module):
 
     def forward(self, x):
         gate_scores = F.softmax(self.gate(x), dim=-1)  # [batch, num_experts] # gate the expert outputs
+        self.last_gate_scores = gate_scores
         expert_outputs = [expert(x) for expert in self.experts]
         expert_outputs = torch.stack(expert_outputs, dim=1)  # [batch, num_experts, output_dim]
         output = torch.einsum("be,beo->bo", gate_scores, expert_outputs)  # mix the expert outputs
