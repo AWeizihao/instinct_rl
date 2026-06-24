@@ -17,6 +17,7 @@ from .normalizer import (
     EmpiricalDiscountedVariationNormalization,
     EmpiricalNormalization,
 )
+from .offline_residual_actor_critic import OfflineResidualActorCritic
 from .parallel_layer import ParallelLayer
 from .residual_moe_actor_critic import EncoderResidualMoEActorCritic, ResidualMoEActorCritic
 from .state_estimator import (

@@ -76,6 +76,10 @@ class FlatPriorWasabiPPO(WasabiPPO):
         flat_prior_checkpoint: str | None = None,
         flat_prior_teacher_policy: dict | None = None,
         flat_prior_obs_components: list[str] | None = None,
+        flat_prior_history_length: int | None = None,
+        flat_prior_action_scale: list[float] | None = None,
+        flat_prior_initialize_actor: bool = True,
+        flat_prior_teacher_std_floor: float | None = None,
         flat_prior_mask_component: str = "flat_prior_mask",
         flat_prior_expert_index: int = 0,
         flat_prior_kl_loss_coef: float = 0.0,
@@ -117,6 +121,7 @@ class FlatPriorWasabiPPO(WasabiPPO):
         parkour_teacher_huber_delta: float = 0.15,
         parkour_teacher_imitation_loss_coef: float = 0.0,
         parkour_teacher_imitation_loss_coef_end: float | None = None,
+        parkour_teacher_imitation_loss_start_iter: int = 0,
         parkour_teacher_imitation_loss_hold_iters: int = 0,
         parkour_teacher_imitation_loss_schedule_iters: int = 0,
         parkour_teacher_cache_actions: bool = True,
@@ -124,6 +129,14 @@ class FlatPriorWasabiPPO(WasabiPPO):
         parkour_teacher_action_scale: list[float] | None = None,
         parkour_teacher_action_loss_weights: list[float] | None = None,
         parkour_teacher_action_clip: float | None = None,
+        visual_depth_sensitivity_loss_coef: float = 0.0,
+        visual_depth_sensitivity_target: float = 0.025,
+        visual_depth_sensitivity_flat_max: float = 0.010,
+        visual_depth_sensitivity_action_indices: list[int] | None = None,
+        visual_depth_sensitivity_depth_component: str = "depth_image",
+        visual_depth_sensitivity_mode: str = "zero",
+        nonfinite_step_guard: bool = False,
+        nonfinite_step_lr_decay: float = 0.5,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -142,6 +155,10 @@ class FlatPriorWasabiPPO(WasabiPPO):
             "joint_vel",
             "actions",
         ]
+        self.flat_prior_history_length = flat_prior_history_length
+        self.flat_prior_action_scale_values = flat_prior_action_scale
+        self.flat_prior_initialize_actor = flat_prior_initialize_actor
+        self.flat_prior_teacher_std_floor = flat_prior_teacher_std_floor
         self.flat_prior_mask_component = flat_prior_mask_component
         self.flat_prior_expert_index = flat_prior_expert_index
         self.flat_prior_kl_loss_coef = flat_prior_kl_loss_coef
@@ -191,6 +208,7 @@ class FlatPriorWasabiPPO(WasabiPPO):
         self.parkour_teacher_imitation_loss_coef = parkour_teacher_imitation_loss_coef
         self._parkour_teacher_imitation_loss_coef_start = parkour_teacher_imitation_loss_coef
         self.parkour_teacher_imitation_loss_coef_end = parkour_teacher_imitation_loss_coef_end
+        self.parkour_teacher_imitation_loss_start_iter = parkour_teacher_imitation_loss_start_iter
         self.parkour_teacher_imitation_loss_hold_iters = parkour_teacher_imitation_loss_hold_iters
         self.parkour_teacher_imitation_loss_schedule_iters = parkour_teacher_imitation_loss_schedule_iters
         self.parkour_teacher_cache_actions = parkour_teacher_cache_actions
@@ -198,11 +216,36 @@ class FlatPriorWasabiPPO(WasabiPPO):
         self.parkour_teacher_action_scale_values = parkour_teacher_action_scale
         self.parkour_teacher_action_loss_weight_values = parkour_teacher_action_loss_weights
         self.parkour_teacher_action_clip = parkour_teacher_action_clip
+        self.visual_depth_sensitivity_loss_coef = visual_depth_sensitivity_loss_coef
+        self.visual_depth_sensitivity_target = visual_depth_sensitivity_target
+        self.visual_depth_sensitivity_flat_max = visual_depth_sensitivity_flat_max
+        self.visual_depth_sensitivity_action_indices = visual_depth_sensitivity_action_indices or [
+            11,
+            12,
+            15,
+            16,
+            19,
+            20,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+        ]
+        self.visual_depth_sensitivity_depth_component = visual_depth_sensitivity_depth_component
+        self.visual_depth_sensitivity_mode = visual_depth_sensitivity_mode
+        self.nonfinite_step_guard = nonfinite_step_guard
+        self.nonfinite_step_lr_decay = nonfinite_step_lr_decay
         self.parkour_teacher_action_scale = None
         self.parkour_teacher_action_loss_weights = None
         self.parkour_teacher_action_input_slice = None
         self.parkour_teacher_action_input_scale = None
         self.parkour_teacher_num_actions = 0
+        self.flat_prior_num_actions = 0
+        self.flat_prior_action_scale = None
+        self.flat_prior_action_input_scales: dict[str, torch.Tensor] = {}
+        self.visual_depth_sensitivity_action_index_tensor = None
         self._parkour_teacher_action_cache: torch.Tensor | None = None
         self.flat_prior_enabled = bool(flat_prior_checkpoint)
         self.parkour_teacher_enabled = bool(parkour_teacher_onnx_dir)
@@ -215,6 +258,12 @@ class FlatPriorWasabiPPO(WasabiPPO):
             self._setup_flat_prior(obs_format, num_actions)
         if self.parkour_teacher_enabled:
             self._setup_parkour_teacher(obs_format, num_actions)
+        if self.visual_depth_sensitivity_loss_coef > 0.0:
+            self.visual_depth_sensitivity_action_index_tensor = torch.tensor(
+                self.visual_depth_sensitivity_action_indices,
+                dtype=torch.long,
+                device=self.device,
+            )
         self._apply_residual_alpha_schedule()
 
     def _setup_parkour_teacher(self, obs_format, num_actions):
@@ -290,7 +339,12 @@ class FlatPriorWasabiPPO(WasabiPPO):
         end = self.parkour_teacher_imitation_loss_coef_end
         if end is None or self.parkour_teacher_imitation_loss_schedule_iters <= 0:
             return self._parkour_teacher_imitation_loss_coef_start
-        schedule_iter = max(self.current_learning_iteration - self.parkour_teacher_imitation_loss_hold_iters, 0)
+        schedule_iter = max(
+            self.current_learning_iteration
+            - self.parkour_teacher_imitation_loss_start_iter
+            - self.parkour_teacher_imitation_loss_hold_iters,
+            0,
+        )
         progress = min(
             schedule_iter / self.parkour_teacher_imitation_loss_schedule_iters,
             1.0,
@@ -363,8 +417,9 @@ class FlatPriorWasabiPPO(WasabiPPO):
             self._parkour_teacher_action_cache = None
 
     def _setup_flat_prior(self, obs_format, num_actions):
+        self.flat_prior_num_actions = num_actions
         checkpoint = self._load_checkpoint(self.flat_prior_checkpoint)
-        teacher_obs_format = self._build_teacher_obs_format(obs_format)
+        teacher_obs_format = self._build_teacher_obs_format(obs_format, num_actions)
         teacher_policy_cfg = self.flat_prior_teacher_policy.copy()
         teacher_class_name = teacher_policy_cfg.pop("class_name", "ActorCritic")
         self.flat_prior_teacher = modules.build_actor_critic(
@@ -380,8 +435,10 @@ class FlatPriorWasabiPPO(WasabiPPO):
             param.requires_grad_(False)
 
         self.flat_prior_normalizer = self._build_teacher_normalizer(checkpoint, teacher_obs_format)
-        self._initialize_flat_expert(checkpoint, teacher_obs_format)
-        self._bias_flat_gate()
+        if self.flat_prior_initialize_actor:
+            self._initialize_flat_expert(checkpoint, teacher_obs_format)
+            self._bias_flat_gate()
+        self._setup_flat_prior_action_scale(num_actions, obs_format["policy"])
 
     def _load_checkpoint(self, checkpoint_path: str) -> dict:
         try:
@@ -418,13 +475,105 @@ class FlatPriorWasabiPPO(WasabiPPO):
                 cap, device=self.device
             )
 
-    def _build_teacher_obs_format(self, obs_format):
+    def _flat_prior_component_frame_dim(self, name: str, num_actions: int) -> int | None:
+        if name in ("joint_pos", "joint_vel", "actions", "teacher_joint_pos", "teacher_joint_vel", "teacher_actions"):
+            return num_actions
+        if name in (
+            "base_ang_vel",
+            "projected_gravity",
+            "velocity_commands",
+            "base_lin_vel",
+            "teacher_base_ang_vel",
+            "teacher_projected_gravity",
+            "teacher_velocity_commands",
+            "teacher_base_lin_vel",
+        ):
+            return 3
+        return None
+
+    def _flat_prior_teacher_shape(self, name: str, shape: tuple, num_actions: int) -> tuple:
+        if self.flat_prior_history_length is None:
+            return shape
+        if len(shape) >= 2:
+            if shape[0] < self.flat_prior_history_length:
+                raise RuntimeError(
+                    f"Flat-prior component {name} has history length {shape[0]}, "
+                    f"cannot slice {self.flat_prior_history_length} frames."
+                )
+            return (self.flat_prior_history_length, *shape[1:])
+
+        component_size = int(torch.tensor(shape).prod().item())
+        frame_dim = self._flat_prior_component_frame_dim(name, num_actions)
+        if frame_dim is None or component_size % frame_dim != 0:
+            raise RuntimeError(
+                f"Flat-prior component {name} has flattened shape {shape}; cannot infer per-frame dim. "
+                "Use an unflattened temporal obs segment or add this component to the frame-dim mapping."
+            )
+        num_frames = component_size // frame_dim
+        if num_frames < self.flat_prior_history_length:
+            raise RuntimeError(
+                f"Flat-prior component {name} has {num_frames} frames, "
+                f"cannot slice {self.flat_prior_history_length} frames."
+            )
+        return (self.flat_prior_history_length, frame_dim)
+
+    def _build_teacher_obs_format(self, obs_format, num_actions: int):
         policy_segments = obs_format["policy"]
         missing = [name for name in self.flat_prior_obs_components if name not in policy_segments]
         if missing:
             raise KeyError(f"Flat-prior obs components missing from policy obs: {missing}")
-        teacher_segments = OrderedDict((name, policy_segments[name]) for name in self.flat_prior_obs_components)
+        teacher_segments = OrderedDict()
+        for name in self.flat_prior_obs_components:
+            shape = tuple(policy_segments[name])
+            teacher_segments[name] = self._flat_prior_teacher_shape(name, shape, num_actions)
         return {"policy": teacher_segments}
+
+    def _slice_flat_prior_component_history(self, name: str, component: torch.Tensor) -> torch.Tensor:
+        if self.flat_prior_history_length is None:
+            return component.reshape(component.shape[0], -1)
+
+        shape = tuple(self.actor_critic.obs_segments[name])
+        if len(shape) >= 2:
+            history = component.reshape(component.shape[0], shape[0], -1)
+        else:
+            component_size = int(torch.tensor(shape).prod().item())
+            frame_dim = self._flat_prior_component_frame_dim(name, self.flat_prior_num_actions)
+            if frame_dim is None or component_size % frame_dim != 0:
+                raise RuntimeError(
+                    f"Flat-prior component {name} has flattened shape {shape}; cannot infer per-frame dim."
+                )
+            history = component.reshape(component.shape[0], component_size // frame_dim, frame_dim)
+        if history.shape[1] < self.flat_prior_history_length:
+            raise RuntimeError(
+                f"Flat-prior component {name} has {history.shape[1]} frames, "
+                f"cannot slice {self.flat_prior_history_length} frames."
+            )
+        return history[:, -self.flat_prior_history_length :, :].reshape(component.shape[0], -1)
+
+    def _setup_flat_prior_action_scale(self, num_actions: int, policy_segments):
+        if self.flat_prior_action_scale_values is None:
+            return
+        if len(self.flat_prior_action_scale_values) != num_actions:
+            raise RuntimeError(
+                f"Flat-prior action scale length mismatch: expected {num_actions}, "
+                f"got {len(self.flat_prior_action_scale_values)}."
+            )
+        self.flat_prior_action_scale = torch.tensor(
+            self.flat_prior_action_scale_values, dtype=torch.float32, device=self.device
+        ).view(1, -1)
+        inverse_scale = (1.0 / self.flat_prior_action_scale).reshape(-1)
+        for name in self.flat_prior_obs_components:
+            if name != "actions" or name not in policy_segments:
+                continue
+            component_size = int(torch.tensor(policy_segments[name]).prod().item())
+            if component_size % num_actions != 0:
+                raise RuntimeError(
+                    f"Flat-prior action-history size mismatch: {component_size} is not divisible by {num_actions}."
+                )
+            repeats = component_size // num_actions
+            if self.flat_prior_history_length is not None:
+                repeats = self.flat_prior_history_length
+            self.flat_prior_action_input_scales[name] = inverse_scale.repeat(repeats).view(1, -1)
 
     def _load_teacher_actor(self, checkpoint: dict):
         actor_state = {
@@ -467,7 +616,7 @@ class FlatPriorWasabiPPO(WasabiPPO):
         return offsets
 
     def _actor_core(self):
-        actor = self.actor_critic.actor
+        actor = getattr(self.actor_critic, "actor", self.actor_critic)
         if isinstance(actor, nn.Sequential):
             return actor[0]
         return actor
@@ -591,7 +740,21 @@ class FlatPriorWasabiPPO(WasabiPPO):
             gate_linears[-1].bias[self.flat_prior_expert_index] += self.flat_prior_gate_bias
 
     def _teacher_obs_from_student_obs(self, obs):
-        teacher_obs = get_subobs_by_components(obs, self.flat_prior_obs_components, self.actor_critic.obs_segments)
+        teacher_obs_parts = []
+        for name in self.flat_prior_obs_components:
+            component = get_subobs_by_components(
+                obs,
+                [name],
+                self.actor_critic.obs_segments,
+                cat=False,
+                temporal=False,
+            )[0]
+            component = self._slice_flat_prior_component_history(name, component)
+            scale = self.flat_prior_action_input_scales.get(name)
+            if scale is not None:
+                component = component * scale.to(device=component.device, dtype=component.dtype)
+            teacher_obs_parts.append(component.reshape(component.shape[0], -1))
+        teacher_obs = torch.cat(teacher_obs_parts, dim=-1)
         return self.flat_prior_normalizer(teacher_obs)
 
     def _flat_prior_mask_from_obs(self, obs, obs_segments):
@@ -621,6 +784,106 @@ class FlatPriorWasabiPPO(WasabiPPO):
 
     def _masked_mean(self, values, mask):
         return torch.sum(values * mask) / torch.clamp(mask.sum(), min=1.0)
+
+    def _depth_ablated_obs(self, obs):
+        component = self.visual_depth_sensitivity_depth_component
+        if component not in self.actor_critic.obs_segments:
+            return None
+        start = 0
+        depth_size = None
+        for name, shape in self.actor_critic.obs_segments.items():
+            size = int(torch.tensor(shape).prod().item())
+            if name == component:
+                depth_size = size
+                break
+            start += size
+        if depth_size is None:
+            return None
+
+        ablated_obs = obs.clone()
+        depth = ablated_obs[:, start : start + depth_size]
+        if self.visual_depth_sensitivity_mode == "zero":
+            depth.zero_()
+        elif self.visual_depth_sensitivity_mode == "one":
+            depth.fill_(1.0)
+        elif self.visual_depth_sensitivity_mode == "noise":
+            depth.copy_(torch.rand_like(depth))
+        else:
+            raise ValueError(f"Unsupported visual_depth_sensitivity_mode {self.visual_depth_sensitivity_mode!r}.")
+        return ablated_obs
+
+    def _compute_visual_depth_sensitivity_loss(self, minibatch, normal_action_mean, flat_mask, stats):
+        ablated_obs = self._depth_ablated_obs(minibatch.obs)
+        if ablated_obs is None:
+            return None
+
+        self.actor_critic.act(ablated_obs)
+        ablated_action_mean = self.actor_critic.action_mean
+        action_delta = (normal_action_mean - ablated_action_mean).square()
+
+        leg_indices = self.visual_depth_sensitivity_action_index_tensor
+        if leg_indices is not None:
+            leg_delta_rms = torch.sqrt(action_delta[:, leg_indices].mean(dim=-1) + 1.0e-8)
+        else:
+            leg_delta_rms = torch.sqrt(action_delta.mean(dim=-1) + 1.0e-8)
+        all_delta_rms = torch.sqrt(action_delta.mean(dim=-1) + 1.0e-8)
+
+        if self.parkour_teacher_enabled:
+            stair_mask = self._parkour_teacher_mask_from_minibatch(minibatch, fallback_flat_mask=flat_mask)
+        elif flat_mask is not None:
+            stair_mask = 1.0 - flat_mask
+        else:
+            stair_mask = torch.ones_like(leg_delta_rms)
+        stair_mask = stair_mask.reshape(-1).float().detach()
+        if flat_mask is None and self.flat_prior_enabled:
+            flat_mask = self._flat_prior_mask_from_minibatch(minibatch)
+        flat_mask = torch.zeros_like(stair_mask) if flat_mask is None else flat_mask.reshape(-1).float().detach()
+
+        stair_target = max(self.visual_depth_sensitivity_target, 1.0e-6)
+        flat_max = max(self.visual_depth_sensitivity_flat_max, 1.0e-6)
+        flat_excess = torch.relu(all_delta_rms - self.visual_depth_sensitivity_flat_max) / flat_max
+        if self.parkour_teacher_enabled:
+            with torch.no_grad():
+                teacher_action = self._parkour_teacher_actions_from_minibatch(minibatch)
+            if leg_indices is not None:
+                normal_teacher_error = torch.sqrt(
+                    (normal_action_mean[:, leg_indices] - teacher_action[:, leg_indices]).square().mean(dim=-1)
+                    + 1.0e-8
+                )
+                ablated_teacher_error = torch.sqrt(
+                    (ablated_action_mean[:, leg_indices] - teacher_action[:, leg_indices]).square().mean(dim=-1)
+                    + 1.0e-8
+                )
+            else:
+                normal_teacher_error = torch.sqrt((normal_action_mean - teacher_action).square().mean(dim=-1) + 1.0e-8)
+                ablated_teacher_error = torch.sqrt(
+                    (ablated_action_mean - teacher_action).square().mean(dim=-1) + 1.0e-8
+                )
+            contrastive_margin = self.visual_depth_sensitivity_target
+            stair_shortfall = torch.relu(contrastive_margin + normal_teacher_error - ablated_teacher_error) / stair_target
+            stats["visual_depth_teacher_error_legs"] = self._masked_mean(normal_teacher_error.detach(), stair_mask)
+            stats["visual_depth_teacher_error_zero_legs"] = self._masked_mean(ablated_teacher_error.detach(), stair_mask)
+            stats["visual_depth_teacher_error_gap"] = self._masked_mean(
+                (ablated_teacher_error - normal_teacher_error).detach(), stair_mask
+            )
+        else:
+            stair_shortfall = torch.relu(self.visual_depth_sensitivity_target - leg_delta_rms) / stair_target
+        stair_loss = self._masked_mean(stair_shortfall.square(), stair_mask)
+        flat_loss = self._masked_mean(flat_excess.square(), flat_mask)
+
+        stats["visual_depth_delta_legs"] = self._masked_mean(leg_delta_rms.detach(), stair_mask)
+        stats["visual_depth_delta_all"] = all_delta_rms.detach().mean()
+        stats["visual_depth_delta_flat"] = self._masked_mean(all_delta_rms.detach(), flat_mask)
+        stats["visual_depth_delta_legs_target_ratio"] = self._masked_mean(
+            (leg_delta_rms.detach() / stair_target).clamp_max(10.0), stair_mask
+        )
+        stats["visual_depth_sensitivity_stair_loss"] = stair_loss.detach()
+        stats["visual_depth_sensitivity_flat_loss"] = flat_loss.detach()
+        stats["visual_depth_sensitivity_mask_fraction"] = stair_mask.mean()
+        stats["visual_depth_sensitivity_target"] = torch.tensor(
+            self.visual_depth_sensitivity_target, device=normal_action_mean.device
+        )
+        return stair_loss + flat_loss
 
     def _actor_gate_scores(self):
         actor = self._actor_core()
@@ -750,14 +1013,11 @@ class FlatPriorWasabiPPO(WasabiPPO):
         losses, inter_vars, stats = super().compute_losses(minibatch)
         stats.update(schedule_stats)
         flat_mask = None
-        needs_flat_mask = (
-            self.flat_prior_enabled
-            and (
-                self.flat_prior_kl_loss_coef > 0.0
-                or self.flat_gate_prior_loss_coef > 0.0
-                or (self.residual_alpha_nonflat_loss_coef > 0.0 and self.residual_alpha_nonflat_target > 0.0)
-            )
-        ) or self.parkour_teacher_enabled
+        needs_flat_mask = self.flat_prior_enabled and (
+            self.flat_prior_kl_loss_coef > 0.0
+            or self.flat_gate_prior_loss_coef > 0.0
+            or (self.residual_alpha_nonflat_loss_coef > 0.0 and self.residual_alpha_nonflat_target > 0.0)
+        )
         if needs_flat_mask:
             flat_mask = self._flat_prior_mask_from_minibatch(minibatch)
             stats["flat_prior_mask_fraction"] = flat_mask.detach().mean()
@@ -765,7 +1025,20 @@ class FlatPriorWasabiPPO(WasabiPPO):
             with torch.no_grad():
                 teacher_obs = self._teacher_obs_from_student_obs(minibatch.obs)
                 teacher_mean = self.flat_prior_teacher.act_inference(teacher_obs)
+                if self.flat_prior_action_scale is not None:
+                    teacher_mean = teacher_mean * self.flat_prior_action_scale.to(
+                        device=teacher_mean.device, dtype=teacher_mean.dtype
+                    )
                 teacher_std = self.flat_prior_teacher.std.unsqueeze(0).expand_as(teacher_mean)
+                if self.flat_prior_action_scale is not None:
+                    teacher_std = teacher_std * self.flat_prior_action_scale.abs().to(
+                        device=teacher_std.device, dtype=teacher_std.dtype
+                    )
+                if self.flat_prior_teacher_std_floor is not None:
+                    teacher_std = teacher_std.clamp_min(self.flat_prior_teacher_std_floor)
+                    stats["flat_prior_teacher_std_floor"] = torch.tensor(
+                        self.flat_prior_teacher_std_floor, device=teacher_std.device
+                    )
             flat_mean_kl = self._mean_only_kl(
                 self.actor_critic.action_mean,
                 teacher_mean,
@@ -860,6 +1133,16 @@ class FlatPriorWasabiPPO(WasabiPPO):
                 stats[f"parkour_teacher_action_mse_{group_name}"] = self._masked_mean(group_delta, teacher_mask)
         self._record_actor_gate_stats(stats, flat_mask)
         self._record_residual_stats(stats, flat_mask)
+        if self.visual_depth_sensitivity_loss_coef > 0.0:
+            visual_loss = self._compute_visual_depth_sensitivity_loss(
+                minibatch,
+                self.actor_critic.action_mean.clone(),
+                flat_mask,
+                stats,
+            )
+            if visual_loss is not None:
+                losses["visual_depth_sensitivity_loss"] = visual_loss
+                stats["visual_depth_sensitivity_loss"] = visual_loss.detach()
         return losses, inter_vars, stats
 
     def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs):
@@ -927,9 +1210,32 @@ class FlatPriorWasabiPPO(WasabiPPO):
             ] + torch.tensor(1.0, device=self.device)
         else:
             std_backup = None
+        if self.nonfinite_step_guard:
+            step_param_backups = [
+                (param, param.detach().clone())
+                for param in self.actor_critic.parameters()
+                if param.requires_grad
+            ]
+        else:
+            step_param_backups = []
         grad_norm = nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
         average_stats["grad_norm"] = average_stats["grad_norm"] + grad_norm.detach()
         self.optimizer.step()
+        if step_param_backups:
+            found_nonfinite = False
+            for param, _ in step_param_backups:
+                if not torch.isfinite(param).all():
+                    found_nonfinite = True
+                    break
+            if found_nonfinite:
+                for param, backup in step_param_backups:
+                    param.data.copy_(backup)
+                self.learning_rate = max(self.learning_rate_min, self.learning_rate * self.nonfinite_step_lr_decay)
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
+                average_stats["nonfinite_step_rollback"] = average_stats[
+                    "nonfinite_step_rollback"
+                ] + torch.tensor(1.0, device=self.device)
         for param, backup in base_param_backups:
             param.data.copy_(backup + (param.data - backup) * grad_scale)
         if std_backup is not None:
